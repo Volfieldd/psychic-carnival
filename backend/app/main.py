@@ -1,23 +1,57 @@
 from __future__ import annotations
 
-from datetime import datetime
+import csv
+from datetime import datetime, timezone
 import io
+import logging
+from zoneinfo import ZoneInfo
 
-import pandas as pd
-import numpy as np
+import httpx
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
-from sqlalchemy import and_, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.core.config import load_app_config
 from app.core.database import Base, engine, get_db
-from app.models.models import Device, Rule, SeriesPoint, Source
-from app.schemas.schemas import AnalyzeRequest, DeviceCreate, DeviceOut, IngestPush, RuleCreate, RuleOut, SimulateRequest, SourceCreate, SourceOut
-from app.services.engine import preprocess, propose_rule, simulate_rule
+from app.models.models import DataPoint, Device, Event, RuleSet
+from app.schemas.schemas import AnalyzeRequest, CurrentStatusOut, DeviceCreate, DeviceOut, DeviceUpdate, RuleCreate, RuleOut, ShellyPullRequest, SimulateRequest
+from app.services.engine import preprocess, propose_rule, simulate
 
-app = FastAPI(title="Energy Pattern Analyzer", version="0.1.0")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("energy-mvp")
+
+app = FastAPI(title="Energy Pattern Analyzer MVP", version="1.0.0")
 Base.metadata.create_all(bind=engine)
-app_config = load_app_config()
+
+
+def parse_ts(raw: str, tz_name: str):
+    raw = str(raw).strip()
+    if raw.isdigit():
+        v = int(raw)
+        if v > 10_000_000_000:
+            dt = datetime.fromtimestamp(v / 1000, tz=timezone.utc)
+        else:
+            dt = datetime.fromtimestamp(v, tz=timezone.utc)
+        return dt.astimezone(ZoneInfo(tz_name)).replace(tzinfo=None)
+    dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if dt.tzinfo:
+        return dt.astimezone(ZoneInfo(tz_name)).replace(tzinfo=None)
+    return dt
+
+
+def must_device(db: Session, device_id: int):
+    d = db.get(Device, device_id)
+    if not d:
+        raise HTTPException(404, "device not found")
+    return d
+
+
+def load_points(db: Session, device_id: int, from_ts: datetime | None, to_ts: datetime | None):
+    q = select(DataPoint).where(DataPoint.device_id == device_id)
+    if from_ts:
+        q = q.where(DataPoint.ts >= from_ts)
+    if to_ts:
+        q = q.where(DataPoint.ts <= to_ts)
+    return db.scalars(q.order_by(DataPoint.ts)).all()
 
 
 @app.get("/health")
@@ -27,205 +61,217 @@ def health():
 
 @app.post("/devices", response_model=DeviceOut)
 def create_device(payload: DeviceCreate, db: Session = Depends(get_db)):
-    db_device = Device(**payload.model_dump())
-    db.add(db_device)
+    item = Device(**payload.model_dump())
+    db.add(item)
     db.commit()
-    db.refresh(db_device)
-    return db_device
+    db.refresh(item)
+    return item
 
 
 @app.get("/devices", response_model=list[DeviceOut])
 def list_devices(db: Session = Depends(get_db)):
-    return db.scalars(select(Device)).all()
+    return db.scalars(select(Device).order_by(Device.created_at.desc())).all()
 
 
 @app.get("/devices/{device_id}", response_model=DeviceOut)
-def get_device(device_id: str, db: Session = Depends(get_db)):
-    item = db.get(Device, device_id)
-    if not item:
-        raise HTTPException(404, "device not found")
+def get_device(device_id: int, db: Session = Depends(get_db)):
+    return must_device(db, device_id)
+
+
+@app.put("/devices/{device_id}", response_model=DeviceOut)
+def update_device(device_id: int, payload: DeviceUpdate, db: Session = Depends(get_db)):
+    item = must_device(db, device_id)
+    for k, v in payload.model_dump(exclude_none=True).items():
+        setattr(item, k, v)
+    db.commit()
+    db.refresh(item)
     return item
 
 
 @app.delete("/devices/{device_id}")
-def delete_device(device_id: str, db: Session = Depends(get_db)):
-    item = db.get(Device, device_id)
-    if not item:
-        raise HTTPException(404, "device not found")
+def delete_device(device_id: int, db: Session = Depends(get_db)):
+    item = must_device(db, device_id)
     db.delete(item)
     db.commit()
     return {"deleted": True}
 
 
-@app.post("/sources", response_model=SourceOut)
-def create_source(payload: SourceCreate, db: Session = Depends(get_db)):
-    item = Source(**payload.model_dump())
-    db.add(item)
-    db.commit()
-    db.refresh(item)
-    return item
-
-
-@app.get("/sources", response_model=list[SourceOut])
-def list_sources(db: Session = Depends(get_db)):
-    return db.scalars(select(Source)).all()
-
-
-@app.post("/ingest/csv")
-async def ingest_csv(device_id: str = Query(...), metric: str = Query("watts"), ts_col: str = Query("ts"), value_col: str = Query("value"), file: UploadFile = File(...), db: Session = Depends(get_db)):
-    if not db.get(Device, device_id):
-        raise HTTPException(404, "device not found")
-    data = await file.read()
+@app.post("/devices/{device_id}/ingest/csv")
+def ingest_csv(device_id: int, file: UploadFile = File(...), timezone_name: str = Query("Europe/Paris"), db: Session = Depends(get_db)):
+    device = must_device(db, device_id)
     try:
-        frame = pd.read_csv(io.BytesIO(data))
-        frame["ts"] = pd.to_datetime(frame[ts_col])
-        frame["value"] = pd.to_numeric(frame[value_col])
+        sample = file.file.read(2048).decode("utf-8", errors="ignore")
+        file.file.seek(0)
+        delimiter = ";" if sample.count(";") > sample.count(",") else ","
+        text = io.TextIOWrapper(file.file, encoding="utf-8", errors="ignore")
+        reader = csv.DictReader(text, delimiter=delimiter)
+        headers = {h.lower().strip(): h for h in (reader.fieldnames or [])}
+        required = ["timestamp", device.main_metric]
+        missing = [c for c in required if c not in headers]
+        if missing:
+            raise HTTPException(400, f"Missing required columns for {device.type}: {', '.join(missing)}")
+
+        added = 0
+        batch = []
+        for row in reader:
+            ts = parse_ts(row[headers["timestamp"]], timezone_name)
+            dp = DataPoint(device_id=device_id, ts=ts)
+            if "watts" in headers and row.get(headers["watts"], "") != "":
+                dp.watts = float(row[headers["watts"]])
+            if "on" in headers and row.get(headers["on"], "") != "":
+                dp.on = float(row[headers["on"]])
+            if "lux" in headers and row.get(headers["lux"], "") != "":
+                dp.lux = float(row[headers["lux"]])
+            batch.append(dp)
+            if len(batch) >= 1000:
+                db.add_all(batch)
+                db.commit()
+                added += len(batch)
+                batch = []
+        if batch:
+            db.add_all(batch)
+            db.commit()
+            added += len(batch)
+        log.info("CSV ingest done device=%s rows=%s", device_id, added)
+        return {"ingested": added}
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(400, f"csv parsing error: {exc}")
-    rows = [SeriesPoint(device_id=device_id, metric=metric, ts=row.ts.to_pydatetime(), value=float(row.value)) for row in frame[["ts", "value"]].itertuples(index=False)]
-    db.add_all(rows)
+        log.exception("csv ingest failed")
+        raise HTTPException(400, f"CSV parsing failed: {exc}")
+
+
+@app.post("/devices/{device_id}/ingest/shelly_pull")
+def ingest_shelly_pull(device_id: int, payload: ShellyPullRequest, db: Session = Depends(get_db)):
+    device = must_device(db, device_id)
+    if payload.from_ts >= payload.to_ts:
+        raise HTTPException(400, "from_ts must be before to_ts")
+    ts = payload.from_ts
+    points = []
+    while ts <= payload.to_ts:
+        value = 0.0
+        if device.shelly_host:
+            try:
+                headers = {"Authorization": f"Bearer {device.shelly_token}"} if device.shelly_token else {}
+                r = httpx.get(f"http://{device.shelly_host}/rpc/Switch.GetStatus?id=0", headers=headers, timeout=2)
+                if r.status_code < 300:
+                    data = r.json()
+                    value = float(data.get("apower", 0.0)) if device.main_metric == "watts" else float(data.get("output", 0))
+            except Exception:
+                pass
+        dp = DataPoint(device_id=device_id, ts=ts)
+        setattr(dp, device.main_metric, value)
+        points.append(dp)
+        ts = datetime.fromtimestamp(ts.timestamp() + payload.interval_sec)
+    db.add_all(points)
     db.commit()
-    return {"ingested": len(rows)}
+    return {"ingested": len(points)}
 
 
-@app.post("/ingest/push")
-def ingest_push(payload: IngestPush, db: Session = Depends(get_db)):
-    if not db.get(Device, payload.device_id):
-        raise HTTPException(404, "device not found")
-    rows = [SeriesPoint(device_id=payload.device_id, metric=payload.metric, ts=p.ts, value=p.value) for p in payload.points]
-    db.add_all(rows)
-    db.commit()
-    return {"ingested": len(rows)}
+@app.get("/devices/{device_id}/stats")
+def stats(device_id: int, db: Session = Depends(get_db)):
+    must_device(db, device_id)
+    min_ts, max_ts, count = db.execute(select(func.min(DataPoint.ts), func.max(DataPoint.ts), func.count(DataPoint.id)).where(DataPoint.device_id == device_id)).one()
+    if count == 0:
+        return {"count": 0, "from": None, "to": None, "holes": 0}
+    rows = db.scalars(select(DataPoint.ts).where(DataPoint.device_id == device_id).order_by(DataPoint.ts)).all()
+    gaps = 0
+    if len(rows) >= 3:
+        deltas = [(rows[i] - rows[i - 1]).total_seconds() for i in range(1, len(rows))]
+        expected = sorted(deltas)[len(deltas) // 2]
+        gaps = sum(1 for d in deltas if d > expected * 2)
+    return {"count": count, "from": min_ts, "to": max_ts, "holes": gaps}
 
 
-@app.post("/ingest/shelly/pull")
-def ingest_shelly_pull(device_id: str, from_ts: datetime, to_ts: datetime, interval_sec: int = 10, db: Session = Depends(get_db)):
-    if not db.get(Device, device_id):
-        raise HTTPException(404, "device not found")
-    # MVP stub: generates synthetic points compatible with shelly integration.
-    rng = pd.date_range(from_ts, to_ts, freq=f"{interval_sec}s")
-    vals = 100 + 900 * (np.sin(np.linspace(0, 6, len(rng))) > 0).astype(int)
-    rows = [SeriesPoint(device_id=device_id, metric="watts", ts=ts.to_pydatetime(), value=float(v)) for ts, v in zip(rng, vals)]
-    db.add_all(rows)
-    db.commit()
-    return {"ingested": len(rows), "source": "shelly-simulated"}
+@app.get("/devices/{device_id}/series")
+def series(device_id: int, from_ts: datetime | None = None, to_ts: datetime | None = None, downsample_sec: int = 30, db: Session = Depends(get_db)):
+    device = must_device(db, device_id)
+    rows = load_points(db, device_id, from_ts, to_ts)
+    points = [{"ts": r.ts, "watts": r.watts, "on": r.on, "lux": r.lux} for r in rows]
+    processed = preprocess(points, metric=device.main_metric, sampling_sec=max(1, downsample_sec))
+    return [{"ts": p["ts"].isoformat(), "watts": p["watts"], "on": p["on"], "lux": p["lux"]} for p in processed]
 
 
-@app.get("/series")
-def get_series(device_id: str, metric: str = "watts", from_ts: datetime | None = None, to_ts: datetime | None = None, downsample_sec: int | None = None, db: Session = Depends(get_db)):
-    clauses = [SeriesPoint.device_id == device_id, SeriesPoint.metric == metric]
-    if from_ts:
-        clauses.append(SeriesPoint.ts >= from_ts)
-    if to_ts:
-        clauses.append(SeriesPoint.ts <= to_ts)
-    rows = db.scalars(select(SeriesPoint).where(and_(*clauses)).order_by(SeriesPoint.ts)).all()
-    frame = pd.DataFrame([{"ts": r.ts, "value": r.value} for r in rows])
-    if frame.empty:
-        return []
-    ds = downsample_sec or int(app_config.defaults["sampling_sec"])
-    frame = preprocess(frame, sampling_sec=ds)
-    return [{"ts": row.ts.isoformat(), "value": float(row.value)} for row in frame.itertuples(index=False)]
+@app.get("/devices/{device_id}/rules", response_model=list[RuleOut])
+def list_rules(device_id: int, db: Session = Depends(get_db)):
+    must_device(db, device_id)
+    return db.scalars(select(RuleSet).where(RuleSet.device_id == device_id).order_by(RuleSet.created_at.desc())).all()
 
 
-@app.post("/rules", response_model=RuleOut)
-def create_rule(payload: RuleCreate, db: Session = Depends(get_db)):
-    if not db.get(Device, payload.device_id):
-        raise HTTPException(404, "device not found")
-    item = Rule(**payload.model_dump())
+@app.post("/devices/{device_id}/rules", response_model=RuleOut)
+def create_rule(device_id: int, payload: RuleCreate, db: Session = Depends(get_db)):
+    must_device(db, device_id)
+    item = RuleSet(device_id=device_id, **payload.model_dump())
     db.add(item)
     db.commit()
     db.refresh(item)
     return item
-
-
-@app.get("/rules", response_model=list[RuleOut])
-def list_rules(device_id: str | None = None, db: Session = Depends(get_db)):
-    query = select(Rule)
-    if device_id:
-        query = query.where(Rule.device_id == device_id)
-    return db.scalars(query).all()
 
 
 @app.put("/rules/{rule_id}", response_model=RuleOut)
 def update_rule(rule_id: int, payload: RuleCreate, db: Session = Depends(get_db)):
-    rule = db.get(Rule, rule_id)
-    if not rule:
+    item = db.get(RuleSet, rule_id)
+    if not item:
         raise HTTPException(404, "rule not found")
-    for k, v in payload.model_dump().items():
-        setattr(rule, k, v)
+    item.name = payload.name
+    item.json = payload.json
     db.commit()
-    db.refresh(rule)
-    return rule
+    db.refresh(item)
+    return item
 
 
-@app.delete("/rules/{rule_id}")
-def delete_rule(rule_id: int, db: Session = Depends(get_db)):
-    rule = db.get(Rule, rule_id)
-    if not rule:
+@app.post("/rules/{rule_id}/activate")
+def activate_rule(rule_id: int, db: Session = Depends(get_db)):
+    item = db.get(RuleSet, rule_id)
+    if not item:
         raise HTTPException(404, "rule not found")
-    db.delete(rule)
+    db.query(RuleSet).filter(RuleSet.device_id == item.device_id).update({RuleSet.is_active: False})
+    item.is_active = True
     db.commit()
-    return {"deleted": True}
+    return {"activated": True}
 
 
-def _load_series_df(db: Session, device_id: str, metric: str, from_ts: datetime | None, to_ts: datetime | None):
-    clauses = [SeriesPoint.device_id == device_id, SeriesPoint.metric == metric]
-    if from_ts:
-        clauses.append(SeriesPoint.ts >= from_ts)
-    if to_ts:
-        clauses.append(SeriesPoint.ts <= to_ts)
-    rows = db.scalars(select(SeriesPoint).where(and_(*clauses)).order_by(SeriesPoint.ts)).all()
-    return pd.DataFrame([{"ts": r.ts, "value": r.value} for r in rows])
+@app.post("/devices/{device_id}/analyze/oneshot")
+def analyze(device_id: int, payload: AnalyzeRequest, db: Session = Depends(get_db)):
+    device = must_device(db, device_id)
+    rows = load_points(db, device_id, payload.from_ts, payload.to_ts)
+    points = preprocess([{"ts": r.ts, "watts": r.watts, "on": r.on, "lux": r.lux} for r in rows], device.main_metric, 30)
+    rule, explanation, score = propose_rule(points, device.main_metric, device.type)
+    return {"proposed_rule": rule, "explanations": explanation, "score": score}
 
 
-@app.post("/simulate")
-def simulate(payload: SimulateRequest, db: Session = Depends(get_db)):
-    frame = _load_series_df(db, payload.device_id, payload.metric, payload.from_ts, payload.to_ts)
-    frame = preprocess(frame, int(app_config.defaults["sampling_sec"]))
-    dsl = payload.dsl
+@app.post("/devices/{device_id}/simulate")
+def simulate_endpoint(device_id: int, payload: SimulateRequest, db: Session = Depends(get_db)):
+    device = must_device(db, device_id)
     if payload.rule_id:
-        db_rule = db.get(Rule, payload.rule_id)
-        if not db_rule:
+        r = db.get(RuleSet, payload.rule_id)
+        if not r or r.device_id != device_id:
             raise HTTPException(404, "rule not found")
-        dsl = db_rule.dsl
-    if not dsl:
-        raise HTTPException(400, "dsl or rule_id required")
-    result = simulate_rule(frame, dsl, payload.metric)
-    return {"states": result.states, "events": result.events, "metrics": result.metrics}
+        rule = r.json
+    elif payload.rule_json:
+        rule = payload.rule_json
+    else:
+        raise HTTPException(400, "rule_json or rule_id required")
+
+    rows = load_points(db, device_id, payload.from_ts, payload.to_ts)
+    points = preprocess([{"ts": r.ts, "watts": r.watts, "on": r.on, "lux": r.lux} for r in rows], device.main_metric, int(rule.get("sampling_sec", 30)))
+    states, events = simulate(points, device.main_metric, rule, int(rule.get("sampling_sec", 30)))
+    for e in events[-200:]:
+        db.add(Event(device_id=device_id, ts=e["ts"], type=e["type"], payload=e["payload"]))
+    db.commit()
+    return {"states": [{"ts": s["ts"].isoformat(), "state": s["state"]} for s in states], "events": [{"ts": e["ts"].isoformat(), "type": e["type"], "payload": e["payload"]} for e in events], "metrics": {"events": len(events), "samples": len(points)}}
 
 
-@app.post("/analyze/oneshot")
-def analyze_oneshot(payload: AnalyzeRequest, db: Session = Depends(get_db)):
-    device = db.get(Device, payload.device_id)
-    if not device:
-        raise HTTPException(404, "device not found")
-    frame = preprocess(_load_series_df(db, payload.device_id, payload.metric, payload.from_ts, payload.to_ts), int(app_config.defaults["sampling_sec"]))
-    template = app_config.templates.get(device.type, app_config.templates["other"]).model_dump()
-    proposal = propose_rule(frame, template, payload.metric)
-    return proposal
-
-
-@app.post("/analyze/auto")
-def analyze_auto(payload: AnalyzeRequest, days: int = 7, db: Session = Depends(get_db)):
-    out = analyze_oneshot(payload, db)
-    out["period_days"] = days
-    return out
-
-
-@app.get("/status/current")
-def status_current(device_id: str, metric: str = "watts", db: Session = Depends(get_db)):
-    status_window_min = int(app_config.defaults["status_window_min"])
-    to_ts = datetime.utcnow()
-    from_ts = to_ts - pd.Timedelta(minutes=status_window_min)
-    frame = preprocess(_load_series_df(db, device_id, metric, from_ts, to_ts), int(app_config.defaults["sampling_sec"]))
-    rules = db.scalars(select(Rule).where(Rule.device_id == device_id)).all()
-    if not rules:
-        return {"state": "UNKNOWN", "reason": "no rule"}
-    sim = simulate_rule(frame, rules[0].dsl, metric)
-    state = sim.states[-1]["state"] if sim.states else "UNKNOWN"
-    return {"state": state, "last_event": sim.events[-1] if sim.events else None, "metrics": sim.metrics}
-
-
-@app.get("/config/effective")
-def effective_config():
-    return app_config.model_dump()
+@app.get("/devices/{device_id}/status/current", response_model=CurrentStatusOut)
+def current_status(device_id: int, window_sec: int = 600, db: Session = Depends(get_db)):
+    device = must_device(db, device_id)
+    active = db.scalars(select(RuleSet).where(RuleSet.device_id == device_id, RuleSet.is_active.is_(True))).first()
+    if not active:
+        raise HTTPException(400, "No active rule")
+    end = datetime.utcnow()
+    start = datetime.fromtimestamp(end.timestamp() - window_sec)
+    rows = load_points(db, device_id, start, end)
+    points = preprocess([{"ts": r.ts, "watts": r.watts, "on": r.on, "lux": r.lux} for r in rows], device.main_metric, int(active.json.get("sampling_sec", 30)))
+    states, events = simulate(points, device.main_metric, active.json, int(active.json.get("sampling_sec", 30)))
+    last_event = events[-1] if events else None
+    return {"state": states[-1]["state"] if states else "UNKNOWN", "last_event": last_event, "window_sec": window_sec}

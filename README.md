@@ -1,85 +1,56 @@
-# Energy Pattern Analyzer (MVP)
+# Energy Pattern Analyzer (MVP pragmatique)
 
-MVP complet dockerisé (API FastAPI + UI React + stockage SQLite/Postgres) pour ingestion de séries temporelles multi-device et génération de règles interprétables (DSL JSON).
-
-## Démarrage rapide
-
+## Lancer
 ```bash
 docker compose up --build
 ```
-
-- API: http://localhost:8000/docs
 - UI: http://localhost:5173
+- API: http://localhost:8000/docs
 
-## Exécuter les tests
+Volumes:
+- `./data` -> SQLite (`/data/app.db`)
+- `./config` -> config YAML (`/config/app.yaml`)
 
-```bash
-docker compose run --rm api pytest
+Variables utiles:
+- `TIMEZONE=Europe/Paris`
+- `DB_PATH=/data/app.db`
+- `CONFIG_PATH=/config/app.yaml`
+
+## CSV “Shelly-like” (format FIXE)
+Colonnes attendues (header insensible casse):
+- `timestamp` (ISO8601, epoch sec, epoch ms)
+- `watts` pour type `power`
+- `on` (0/1) pour type `light`
+- `lux` pour type `lux`
+
+Séparateur accepté: `,` ou `;`.
+
+Exemple:
+```csv
+timestamp;watts;on;lux
+2026-01-04T10:00:00+01:00;0;0;24
+2026-01-04T10:00:30+01:00;1800;1;40
+1735981230000;1500;1;42
 ```
 
-## Configuration
+## Scénarios
+1. **Sèche-linge (watts)**: créer device `power` + `main_metric=watts`, importer `examples/dryer_watts.csv`, analyze/simulate/activate.
+2. **Lumière (on/off)**: créer device `light` + `main_metric=on`, importer `examples/light_onoff.csv`.
+3. **Capteur lux**: créer device `lux` + `main_metric=lux`, importer un CSV avec `timestamp,lux`.
 
-Le fichier `config/app.yaml` est chargé au démarrage.
-
-Variables d'environnement utiles:
-- `DB_URL` (défaut SQLite local: `sqlite:////app/data/app.db`)
-- `CONFIG_PATH` (défaut `/app/config/app.yaml`)
-- `LOG_LEVEL`
-
-### Option Postgres
-
-```bash
-docker compose --profile postgres up --build
-```
-
-Exemple `DB_URL` Postgres:
-`postgresql+psycopg2://energy:energy@db:5432/energy`
-
-## API principales
-
-- `/devices` CRUD
-- `/sources` CRUD (`csv`, `shelly`, `generic_http_pull`)
-- `/ingest/csv` upload CSV + mapping colonnes
-- `/ingest/shelly/pull` MVP simulé compatible flux Shelly
-- `/ingest/push` webhook points temps réel
-- `/series` lecture + downsampling
-- `/rules` CRUD règles DSL
-- `/simulate` applique DSL -> states/events
-- `/analyze/oneshot` propose règle + explication + score
-- `/analyze/auto` consolidation simple sur période
-- `/status/current` état glissant
-- `/config/effective` YAML effectif
-
-## DSL JSON (extrait)
-
+## Endpoints principaux
+1. `POST /devices` création device
 ```json
-{
-  "metric": "watts",
-  "states": [
-    {
-      "name": "RUNNING",
-      "entry": {"type": "threshold", "op": "gte", "value": 1200, "for_sec": 60},
-      "exit": {"type": "threshold", "op": "lte", "value": 80, "for_sec": 60}
-    }
-  ],
-  "patterns": {
-    "oscillation": {"enabled": true},
-    "plateau": {"enabled": true},
-    "duty_cycle": {"enabled": true},
-    "drops_to_zero": {"enabled": true}
-  },
-  "events": ["START", "STOP"]
-}
+{"name":"Dryer","type":"power","source_type":"csv","main_metric":"watts"}
 ```
+2. `POST /devices/{id}/ingest/csv` upload fichier
+3. `POST /devices/{id}/analyze/oneshot` proposition de règle
+4. `POST /devices/{id}/simulate` simulation (`rule_json` ou `rule_id`)
+5. `GET /devices/{id}/status/current?window_sec=600` état courant + dernier event
 
-## Exemples fournis
-
-- `examples/dryer_watts.csv`
-- `examples/light_onoff.csv`
-- `examples/kettle_watts.csv`
-- `examples/rules/*.json`
-
-## Notes MVP
-
-- Module `scenes` multi-device déclaratif présent dans `config/app.yaml`, désactivé par défaut.
-- Moteur commun multi-métriques (watts, onoff, lux...) avec preprocess, segmentation, features et simulation.
+API complète attendue aussi disponible:
+- Devices CRUD
+- `POST /devices/{id}/ingest/shelly_pull`
+- `GET /devices/{id}/stats`
+- `GET /devices/{id}/series`
+- rules list/create/update/activate
