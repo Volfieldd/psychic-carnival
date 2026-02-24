@@ -3,84 +3,78 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
-class DeviceBase(BaseModel):
-    id: str
+class DeviceCreate(BaseModel):
     name: str
-    type: str
-    metrics: list[str] = []
-    source_config: dict[str, Any] = {}
+    type: str = Field(pattern="^(power|light|lux|other)$")
+    source_type: str = Field(pattern="^(csv|shelly)$")
+    shelly_host: str | None = None
+    shelly_token: str | None = None
+    main_metric: str = Field(pattern="^(watts|on|lux)$")
 
 
-class DeviceCreate(DeviceBase):
-    pass
+class DeviceUpdate(BaseModel):
+    name: str | None = None
+    type: str | None = None
+    source_type: str | None = None
+    shelly_host: str | None = None
+    shelly_token: str | None = None
+    main_metric: str | None = None
 
 
-class SourceBase(BaseModel):
-    name: str
-    kind: str
-    config: dict[str, Any] = {}
-
-
-class SourceCreate(SourceBase):
-    pass
-
-
-class SourceOut(SourceBase):
+class DeviceOut(DeviceCreate):
     id: int
+    created_at: datetime
 
     class Config:
         from_attributes = True
 
 
-class DeviceOut(DeviceBase):
-    class Config:
-        from_attributes = True
-
-
-class RuleBase(BaseModel):
+class RuleCreate(BaseModel):
     name: str
-    dsl: dict[str, Any]
-    explanation: str = ""
-    confidence: float = 0
+    json: dict[str, Any]
 
 
-class RuleCreate(RuleBase):
-    device_id: str
-
-
-class RuleOut(RuleBase):
+class RuleOut(BaseModel):
     id: int
-    device_id: str
+    device_id: int
+    name: str
+    json: dict[str, Any]
+    is_active: bool
+    created_at: datetime
 
     class Config:
         from_attributes = True
-
-
-class SeriesPointIn(BaseModel):
-    ts: datetime
-    value: float
-
-
-class IngestPush(BaseModel):
-    device_id: str
-    metric: str
-    points: list[SeriesPointIn]
 
 
 class AnalyzeRequest(BaseModel):
-    device_id: str
-    metric: str = "watts"
     from_ts: datetime | None = None
     to_ts: datetime | None = None
+    template: str | None = None
 
 
 class SimulateRequest(BaseModel):
-    device_id: str
-    metric: str = "watts"
-    rule_id: int | None = None
-    dsl: dict[str, Any] | None = None
     from_ts: datetime | None = None
     to_ts: datetime | None = None
+    rule_json: dict[str, Any] | None = None
+    rule_id: int | None = None
+
+
+class ShellyPullRequest(BaseModel):
+    from_ts: datetime
+    to_ts: datetime
+    interval_sec: int = 30
+
+
+class EventOut(BaseModel):
+    ts: datetime
+    type: str
+    payload: dict[str, Any]
+
+
+class CurrentStatusOut(BaseModel):
+    state: str
+    last_event: EventOut | None
+    window_sec: int

@@ -1,108 +1,122 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from datetime import datetime
+import statistics
 from typing import Any
 
 import numpy as np
-import pandas as pd
 
 
-@dataclass
-class SimulationResult:
-    states: list[dict[str, Any]]
-    events: list[dict[str, Any]]
-    metrics: dict[str, float]
+def preprocess(points: list[dict[str, Any]], metric: str, sampling_sec: int = 30) -> list[dict[str, Any]]:
+    if not points:
+        return []
+    points = sorted(points, key=lambda x: x["ts"])
+    vals = [p[metric] for p in points if p.get(metric) is not None]
+    if not vals:
+        return points
+    q1, q3 = np.quantile(vals, [0.25, 0.75])
+    iqr = q3 - q1
+    low, high = q1 - 3 * iqr, q3 + 3 * iqr
+    for p in points:
+        if p.get(metric) is not None:
+            p[metric] = float(max(low, min(high, p[metric])))
+
+    bucketed = {}
+    for p in points:
+        t = int(p["ts"].timestamp())
+        bt = t - (t % sampling_sec)
+        key = datetime.fromtimestamp(bt)
+        bucketed.setdefault(key, []).append(p)
+
+    out = []
+    for ts in sorted(bucketed.keys()):
+        group = bucketed[ts]
+        item = {"ts": ts, "watts": None, "on": None, "lux": None}
+        for m in ["watts", "on", "lux"]:
+            vals = [g[m] for g in group if g.get(m) is not None]
+            if vals:
+                item[m] = float(statistics.median(vals))
+        out.append(item)
+    return out
 
 
-def preprocess(df: pd.DataFrame, sampling_sec: int = 10) -> pd.DataFrame:
-    if df.empty:
-        return df
-    out = df.copy()
-    out = out.sort_values("ts").set_index("ts")
-    out = out.resample(f"{sampling_sec}s").mean().interpolate(limit=3)
-    out["value"] = out["value"].rolling(3, min_periods=1).median()
-    return out.reset_index()
-
-
-def detect_oscillation(values: np.ndarray, tolerance: float = 0.15, min_cycles: int = 3) -> dict[str, Any]:
-    if len(values) < 8:
-        return {"detected": False, "cycles": 0}
-    centered = values - np.mean(values)
-    signs = np.sign(centered)
-    cross = np.sum(np.abs(np.diff(signs)) > 0)
-    cycles = cross // 2
-    amplitude = (np.percentile(values, 90) - np.percentile(values, 10)) / max(np.mean(values), 1e-6)
-    detected = cycles >= min_cycles and amplitude >= tolerance
-    return {"detected": bool(detected), "cycles": int(cycles), "amplitude": float(amplitude)}
-
-
-def segment_active(df: pd.DataFrame, rule: dict[str, Any]) -> pd.Series:
-    cond = rule["states"][0]["entry"]
-    op = cond["op"]
-    val = cond.get("value", 0)
+def condition_true(value: float | None, cond: dict[str, Any]) -> bool:
+    if value is None:
+        return False
+    op = cond.get("op")
     if op == "gte":
-        mask = df["value"] >= val
-    elif op == "lte":
-        mask = df["value"] <= val
-    elif op == "between":
-        low, high = cond["range"]
-        mask = df["value"].between(low, high)
-    else:
-        mask = df["value"] > val
-    for_sec = cond.get("for_sec", 0)
-    if for_sec > 0 and len(mask) > 1:
-        sample_sec = max(1, int((df["ts"].iloc[1] - df["ts"].iloc[0]).total_seconds()))
-        window = max(1, int(for_sec / sample_sec))
-        mask = mask.rolling(window, min_periods=1).mean() == 1
-    return mask.fillna(False)
+        return value >= cond["value"]
+    if op == "lte":
+        return value <= cond["value"]
+    if op == "between":
+        return cond["min"] <= value <= cond["max"]
+    return False
 
 
-def simulate_rule(df: pd.DataFrame, rule: dict[str, Any], metric_name: str = "watts") -> SimulationResult:
-    if df.empty:
-        return SimulationResult(states=[], events=[], metrics={"active_ratio": 0.0})
-    active = segment_active(df, rule)
-    states = [{"ts": r.ts.isoformat(), "state": "RUNNING" if a else "IDLE"} for r, a in zip(df.itertuples(), active)]
+def simulate(points: list[dict[str, Any]], metric: str, rule: dict[str, Any], sampling_sec: int = 30):
+    states = []
     events = []
-    prev = False
-    for row, curr in zip(df.itertuples(), active):
-        if curr and not prev:
-            events.append({"ts": row.ts.isoformat(), "event": "START"})
-        if prev and not curr:
-            events.append({"ts": row.ts.isoformat(), "event": "STOP"})
-        prev = bool(curr)
-    metrics = {"active_ratio": float(active.mean())}
-    if metric_name == "watts":
-        metrics["energy_wh"] = float(np.trapz(df["value"], dx=1) / 3600)
-    return SimulationResult(states=states, events=events, metrics=metrics)
+    current = "OFF"
+    counters = {}
+    for p in points:
+        new_state = current
+        for state in rule.get("states", []):
+            cond = state.get("when", {})
+            name = state.get("name", "UNKNOWN")
+            key = f"{name}:{cond}"
+            counters.setdefault(key, 0)
+            if condition_true(p.get(metric), cond):
+                counters[key] += sampling_sec
+            else:
+                counters[key] = 0
+            if counters[key] >= cond.get("for_sec", sampling_sec):
+                new_state = name
+        if new_state != current:
+            events.append({"ts": p["ts"], "type": "STATE_CHANGE", "payload": {"from": current, "to": new_state}})
+            current = new_state
+        states.append({"ts": p["ts"], "state": current})
+
+    if rule.get("patterns", {}).get("drops_to_zero", {}).get("enabled"):
+        drops = 0
+        for i in range(1, len(points)):
+            prev = points[i - 1].get(metric) or 0
+            cur = points[i].get(metric) or 0
+            if prev > 0 and cur == 0:
+                drops += 1
+        if drops >= rule["patterns"]["drops_to_zero"].get("min_drops", 2):
+            events.append({"ts": points[-1]["ts"], "type": "DROPS_TO_ZERO", "payload": {"drops": drops}})
+
+    return states, events
 
 
-def propose_rule(df: pd.DataFrame, template: dict[str, Any], metric: str = "watts") -> dict[str, Any]:
-    if df.empty:
-        threshold = template["thresholds"]["start"]
+def propose_rule(points: list[dict[str, Any]], metric: str, device_type: str):
+    vals = np.array([p[metric] for p in points if p.get(metric) is not None], dtype=float)
+    if len(vals) == 0:
+        return {"name": "empty", "states": []}, "No data", 0.0
+
+    p50 = float(np.quantile(vals, 0.5))
+    p90 = float(np.quantile(vals, 0.9))
+    if metric == "watts":
+        start = max(5.0, p90 * 0.6)
+        idle_low, idle_high = 1.0, max(5.0, p50 * 0.5)
+        rule = {
+            "metric": metric,
+            "sampling_sec": 30,
+            "states": [
+                {"name": "RUNNING", "when": {"op": "gte", "value": round(start, 2), "for_sec": 60}},
+                {"name": "IDLE_ON", "when": {"op": "between", "min": idle_low, "max": round(idle_high, 2), "for_sec": 180}},
+                {"name": "OFF", "when": {"op": "lte", "value": 0.5, "for_sec": 60}},
+            ],
+            "patterns": {
+                "oscillation": {"enabled": True, "band": [round(p50 * 0.5, 2), round(p50 * 1.5, 2)], "period_sec": 120, "tolerance_sec": 60, "for_cycles": 3},
+                "drops_to_zero": {"enabled": True, "min_drops": 2},
+            },
+        }
+    elif metric == "on":
+        rule = {"metric": metric, "sampling_sec": 10, "states": [{"name": "RUNNING", "when": {"op": "gte", "value": 1, "for_sec": 10}}, {"name": "OFF", "when": {"op": "lte", "value": 0, "for_sec": 10}}], "patterns": {"drops_to_zero": {"enabled": False}}}
     else:
-        threshold = float(np.percentile(df["value"], 85))
-    idle = float(np.percentile(df["value"], 15)) if not df.empty else template["thresholds"]["idle"]
-    osc = detect_oscillation(df["value"].to_numpy(), template["params"]["tolerance"], int(template["params"]["min_cycles"])) if not df.empty else {"detected": False, "cycles": 0}
-    dsl = {
-        "metric": metric,
-        "states": [
-            {
-                "name": "RUNNING",
-                "entry": {"type": "threshold", "op": "gte", "value": round(threshold, 2), "for_sec": int(template["params"]["min_duration_sec"])},
-                "exit": {"type": "threshold", "op": "lte", "value": round(idle, 2), "for_sec": 30},
-            }
-        ],
-        "patterns": {
-            "oscillation": osc,
-            "plateau": {"enabled": template["patterns"].get("plateau", False)},
-            "duty_cycle": {"enabled": template["patterns"].get("duty_cycle", False)},
-            "drops_to_zero": {"enabled": template["patterns"].get("drops_to_zero", False)},
-        },
-        "events": ["START", "STOP"],
-    }
-    confidence = min(0.95, 0.55 + (0.1 if osc.get("detected") else 0) + (0.2 if threshold > idle else 0))
-    return {
-        "dsl": dsl,
-        "explanation": f"Threshold start ajusté au p85={threshold:.1f}, idle au p15={idle:.1f}. Oscillation détectée={osc.get('detected', False)}.",
-        "confidence": confidence,
-    }
+        thr = round(float(np.quantile(vals, 0.7)), 2)
+        rule = {"metric": metric, "sampling_sec": 30, "states": [{"name": "RUNNING", "when": {"op": "gte", "value": thr, "for_sec": 60}}, {"name": "OFF", "when": {"op": "lte", "value": max(0.0, thr * 0.4), "for_sec": 120}}], "patterns": {"drops_to_zero": {"enabled": False}}}
+    exp = f"Template {device_type} ajusté par quantiles (p50={p50:.2f}, p90={p90:.2f})."
+    score = min(0.99, max(0.55, len(vals) / 5000))
+    return rule, exp, score
