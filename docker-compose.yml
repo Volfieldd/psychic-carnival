@@ -1,0 +1,37 @@
+services:
+  api:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_URL=${DB_URL:-sqlite:////app/data/app.db}
+      - CONFIG_PATH=/app/config/app.yaml
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./config:/app/config
+      - app_data:/app/data
+
+  ui:
+    build: ./ui
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - api
+
+  db:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    environment:
+      - POSTGRES_USER=energy
+      - POSTGRES_PASSWORD=energy
+      - POSTGRES_DB=energy
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+volumes:
+  app_data:
+  pg_data:

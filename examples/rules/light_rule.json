@@ -1,0 +1,6 @@
+{
+  "metric": "onoff",
+  "states": [{"name": "ON", "entry": {"type": "threshold", "op": "gte", "value": 1, "for_sec": 0}, "exit": {"type": "threshold", "op": "lte", "value": 0, "for_sec": 0}}],
+  "patterns": {"duty_cycle": {"enabled": true}},
+  "events": ["START", "STOP"]
+}
