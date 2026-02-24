@@ -1,0 +1,88 @@
+defaults:
+  timezone: Europe/Paris
+  sampling_sec: 10
+  downsample: 120
+  analysis_window_hours: 24
+  status_window_min: 20
+
+templates:
+  dryer:
+    expected_metrics: [watts, watt_hours]
+    thresholds:
+      start: 500
+      end: 120
+      idle: 5
+    patterns:
+      oscillation: true
+      plateau: true
+      duty_cycle: true
+      drops_to_zero: true
+    params:
+      period_sec: 120
+      tolerance: 0.15
+      min_cycles: 4
+      min_duration_sec: 300
+  light:
+    expected_metrics: [onoff, watts, lux]
+    thresholds:
+      start: 1
+      end: 0
+      idle: 0
+    patterns:
+      oscillation: false
+      plateau: false
+      duty_cycle: true
+      drops_to_zero: false
+    params:
+      period_sec: 60
+      tolerance: 0.1
+      min_cycles: 2
+      min_duration_sec: 60
+  kettle:
+    expected_metrics: [watts, watt_hours]
+    thresholds:
+      start: 1000
+      end: 100
+      idle: 5
+    patterns:
+      oscillation: false
+      plateau: true
+      duty_cycle: true
+      drops_to_zero: true
+    params:
+      period_sec: 30
+      tolerance: 0.1
+      min_cycles: 2
+      min_duration_sec: 45
+  other:
+    expected_metrics: [watts, onoff, lux]
+    thresholds:
+      start: 100
+      end: 20
+      idle: 0
+    patterns:
+      oscillation: false
+      plateau: true
+      duty_cycle: true
+      drops_to_zero: false
+    params:
+      period_sec: 60
+      tolerance: 0.2
+      min_cycles: 2
+      min_duration_sec: 60
+
+scoring:
+  fp_weight: 0.4
+  fn_weight: 0.6
+  min_confidence: 0.55
+
+scenes:
+  enabled: false
+  definitions:
+    - name: BREAKFAST
+      window: ["06:00", "10:00"]
+      when:
+        - device: kettle_1
+          state: RUNNING
+        - device: kitchen_light
+          state: ON

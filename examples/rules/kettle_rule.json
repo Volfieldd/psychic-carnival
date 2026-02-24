@@ -1,0 +1,6 @@
+{
+  "metric": "watts",
+  "states": [{"name": "RUNNING", "entry": {"type": "threshold", "op": "gte", "value": 1500, "for_sec": 10}, "exit": {"type": "threshold", "op": "lte", "value": 100, "for_sec": 10}}],
+  "patterns": {"plateau": {"enabled": true}},
+  "events": ["START", "STOP"]
+}
